@@ -15,6 +15,10 @@ find_package(Threads REQUIRED)
 set(SRC_DIR ${CMAKE_SOURCE_DIR}/src)
 set(INC_DIR ${CMAKE_SOURCE_DIR}/include)
 set(TEST_DIR ${CMAKE_SOURCE_DIR}/tests)
+set(BIN_DIR ${CMAKE_SOURCE_DIR}/bin)
+
+# 所有可执行文件输出到 bin/
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${BIN_DIR})
 
 # 源文件
 file(GLOB SOURCES "${SRC_DIR}/*.cpp")
@@ -23,7 +27,7 @@ file(GLOB SOURCES "${SRC_DIR}/*.cpp")
 include_directories(${INC_DIR})
 
 # 创建单元测试可执行文件
-add_executable(unit_test 
+add_executable(unit_test
     ${SOURCES}
     ${TEST_DIR}/UnitTest.cpp
 )
@@ -40,11 +44,11 @@ target_link_libraries(perf_test PRIVATE Threads::Threads)
 
 # 添加测试命令
 add_custom_target(test
-    COMMAND ./unit_test
+    COMMAND ${BIN_DIR}/unit_test
     DEPENDS unit_test
 )
 
 add_custom_target(perf
-    COMMAND ./perf_test
+    COMMAND ${BIN_DIR}/perf_test
     DEPENDS perf_test
 )

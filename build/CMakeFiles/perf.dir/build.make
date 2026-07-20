@@ -66,8 +66,8 @@ include CMakeFiles/perf.dir/compiler_depend.make
 # Include the progress variables for this target.
 include CMakeFiles/perf.dir/progress.make
 
-CMakeFiles/perf: perf_test
-	./perf_test
+CMakeFiles/perf: /home/wevix/memory_pool_2/bin/perf_test
+	/home/wevix/memory_pool_2/bin/perf_test
 
 perf: CMakeFiles/perf
 perf: CMakeFiles/perf.dir/build.make

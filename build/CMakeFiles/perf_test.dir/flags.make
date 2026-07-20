@@ -6,5 +6,5 @@ CXX_DEFINES =
 
 CXX_INCLUDES = -I/home/wevix/memory_pool_2/include
 
-CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -Wall -O2
+CXX_FLAGS = -std=gnu++17 -Wall -O2
 

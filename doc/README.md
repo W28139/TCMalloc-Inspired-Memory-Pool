@@ -1,6 +1,6 @@
 # 文档索引
 
-仿 TCMalloc 内存池项目的辅助文档，按类别组织。
+仿 TCMalloc 内存池项目的辅助文档。
 
 ---
 
@@ -8,42 +8,39 @@
 
 ```
 doc/
-├── README.md              ← 你在这里
-├── 设计问题/               ← 设计层面的问题与改进方向
-├── 疑难点/                 ← 学习过程中的 Q&A
-└── bug/                   ← 已发现的 bug（待修复）
+├── README.md
+├── optimizations/   ← 所有可优化点（bug / 性能 / 设计 / 工程）
+└── qa/              ← 学习过程中的 Q&A
 ```
 
 ---
 
-## 设计问题
+## 优化项
 
-与真正 TCMalloc 的差异、当前实现的设计缺陷、待改进点。
+按优先级排列，建议从上到下依次处理。
 
-| 文件 | 简述 |
-|:---|:---|
-| [批量传输.md](设计问题/批量传输.md) | CentralCache → ThreadCache 每次只传 1 块，真 TCMalloc 批量传多块。含三种修改方案 |
+| 序号 | 文件 | 简述 | 类型 |
+|:---|:---|:---|:---|
+| 01 | [freeCount重复计数导致永不归还](optimizations/01-freeCount重复计数导致永不归还.md) | `updateSpanFreeCount` 累加导致 freeCount 虚高，Span 永不归还 | 🐛 Bug |
+| 02 | [freeListSize无符号下溢](optimizations/02-freeListSize无符号下溢.md) | `size_t` 减到 0 以下回绕到 SIZE_MAX | 🐛 Bug |
+| 03 | [spanTrackers溢出无保护](optimizations/03-spanTrackers溢出无保护.md) | 超 1024 个 Span 后静默跳过，内存泄漏 | 🐛 Bug |
+| 04 | [批量传输](optimizations/04-批量传输.md) | fetchRange 每次只给 1 块 vs TCMalloc 批量传输。含修改方案 | ⚡ 性能 |
+| 05 | [mmap未归还OS](optimizations/05-mmap未归还OS.md) | PageCache 只缓存不释放，长期进程内存只增不减 | 🛡️ 设计 |
+| 06 | [getSpanTracker线性遍历](optimizations/06-getSpanTracker线性遍历.md) | O(n) 扫描 spanTrackers_，Span 多时变慢 | ⚡ 性能 |
+| 07 | [performDelayedReturn中使用unordered_map](optimizations/07-performDelayedReturn中使用unordered_map.md) | 持自旋锁期间触发 `unordered_map` 堆分配，含循环依赖风险 | ⚡ 安全 |
+| 08 | [ThreadCache数组占用过大](optimizations/08-ThreadCache数组占用过大.md) | 每线程 512KB TLS，100 线程 = 50MB | 💾 内存 |
+| 09 | [配置参数硬编码](optimizations/09-配置参数硬编码.md) | 阈值全部硬编码，无法运行时调整 | 🔧 工程 |
+| 10 | [blockNum等于1时无SpanTracker](optimizations/10-blockNum等于1时无SpanTracker.md) | blockNum==1 时无 SpanTracker，大块永不回收 | 🐛 Bug |
+| 11 | [PageCache中的new可能导致循环依赖](optimizations/11-PageCache中的new可能导致循环依赖.md) | `new Span` 本质是 malloc，若作为 malloc 替代品会死锁 | 🐛 隐患 |
 
 ---
 
 ## 疑难点
 
-学习项目源码时产生的疑问和解答。
-
 | 文件 | 简述 |
 |:---|:---|
-| [PageCache为什么需要锁.md](疑难点/PageCache为什么需要锁.md) | CentralCache 已有桶级自旋锁，为什么 PageCache 还要一把 `std::mutex`？分层锁设计解析 |
+| [why-pagecache-needs-mutex](qa/PageCache为什么需要锁.md) | CentralCache 已有桶锁，PageCache 的 mutex_ 是否多余？分层锁设计解析 |
 
 ---
 
-## Bug
-
-已发现但尚未修复的问题。
-
-| 文件 | 简述 |
-|:---|:---|
-| [PageCache中的new可能导致循环依赖.md](bug/PageCache中的new可能导致循环依赖.md) | `new Span` 本质上就是 malloc。一旦将内存池作为 malloc 替代品会形成死锁。含三种修复方案 |
-
----
-
-> 有新发现随时往对应目录加文件，然后更新这个索引。
+> 图例：🐛 Bug ⚡ 性能 💾 内存 🛡️ 设计 🔧 工程

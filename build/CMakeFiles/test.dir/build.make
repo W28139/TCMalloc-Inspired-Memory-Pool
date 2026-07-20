@@ -66,8 +66,8 @@ include CMakeFiles/test.dir/compiler_depend.make
 # Include the progress variables for this target.
 include CMakeFiles/test.dir/progress.make
 
-CMakeFiles/test: unit_test
-	./unit_test
+CMakeFiles/test: /home/wevix/memory_pool_2/bin/unit_test
+	/home/wevix/memory_pool_2/bin/unit_test
 
 test: CMakeFiles/test
 test: CMakeFiles/test.dir/build.make
