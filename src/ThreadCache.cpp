@@ -32,7 +32,7 @@ void* ThreadCache::allocate(size_t size)
         return ptr;
     }
     
-    // 如果线程本地自由链表为空，则从中心缓存获取一批内存
+    // 如果线程本地自由链表为空，则从中心缓存获取一块内存
     return fetchFromCentralCache(index);
 }
 
@@ -70,7 +70,7 @@ bool ThreadCache::shouldReturnToCentralCache(size_t index)
 
 void* ThreadCache::fetchFromCentralCache(size_t index)
 {
-    // 从中心缓存批量获取内存
+    // 从中心缓存一块获取内存
     void* start = CentralCache::getInstance().fetchRange(index);
     if (!start) return nullptr;
 
