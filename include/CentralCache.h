@@ -61,7 +61,7 @@
 //   #07 unordered_map→scanCount     (消除自旋锁临界区内的堆分配)
 //   #10 blockNum==1 也创建 Tracker   (大块内存正确回收)
 
-namespace Kama_memoryPool
+namespace wevix_memoryPool
 {
 
 // Span 追踪器 —— 每个从 PageCache 分配的 Span 对应一个
@@ -143,4 +143,4 @@ private:
     static const std::chrono::milliseconds DELAY_INTERVAL; // 1 秒
 };
 
-} // namespace Kama_memoryPool
+} // namespace wevix_memoryPool

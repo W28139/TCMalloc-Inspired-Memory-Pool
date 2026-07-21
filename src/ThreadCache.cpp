@@ -23,7 +23,7 @@
 //   fetchFromCentralCache 中 freeListSize_ 加 batchNum-1 而非 batchNum
 //   （原代码两个错误互相抵消：allocate 多减 1 + fetch 多加 1 = 巧合正确）
 
-namespace Kama_memoryPool
+namespace wevix_memoryPool
 {
 
 // =========================================================================
@@ -89,8 +89,8 @@ void ThreadCache::deallocate(void* ptr, size_t size)
     // 头插法插入自由链表：新块.next = 旧链表头
     // 插入前：freeList_[index] → [旧链表...]
     // 插入后：freeList_[index] → [ptr] → [旧链表...]
-    *reinterpret_cast<void**>(ptr) = freeList_[index];
-    freeList_[index] = ptr;
+    *reinterpret_cast<void**>(ptr) = freeList_[index];  // 改变ptr的指针指向
+    freeList_[index] = ptr;                             // 改变freeList_的存储内容
 
     // 计数 +1
     freeListSize_[index]++;
@@ -161,44 +161,43 @@ void ThreadCache::returnToCentralCache(void* start, size_t size)
     size_t index = SizeClass::getIndex(size);
     size_t alignedSize = SizeClass::roundUp(size);
 
-    // 当前链表长度
     size_t batchNum = freeListSize_[index];
-    if (batchNum <= 1) return; // 只有 1 块就不还了
+    if (batchNum <= 1) return;
 
-    // 保留 1/4，归还 3/4
+    // 预期保留 1/4，归还 3/4
     size_t keepNum = std::max(batchNum / 4, size_t(1));
-    size_t returnNum = batchNum - keepNum;
 
-    // 遍历链表找到保留部分的尾节点（第 keepNum 个节点）
-    char* current = static_cast<char*>(start);
-    char* splitNode = current;
+    // 遍历链表找到保留部分的尾节点，同时统计实际遍历到的节点数
+    // 如果链表实际长度 < freeListSize_（计数器出现偏差），
+    // 用实际遍历到的节点数修正，而非静默跳过导致死循环
+    char* splitNode = static_cast<char*>(start);
+    size_t actualKeep = 1;  // start 算第 1 个
     for (size_t i = 0; i < keepNum - 1; ++i)
     {
-        splitNode = reinterpret_cast<char*>(*reinterpret_cast<void**>(splitNode));
-        if (splitNode == nullptr)
-        {
-            // 链表比预期短，调整归还数量
-            returnNum = batchNum - (i + 1);
-            break;
-        }
+        void* next = *reinterpret_cast<void**>(splitNode);
+        if (next == nullptr)
+            break;  // 链表比计数器短，以实际为准
+        splitNode = static_cast<char*>(next);
+        actualKeep++;
     }
 
-    if (splitNode != nullptr)
+    // 在分割点断开链表
+    void* nextNode = *reinterpret_cast<void**>(splitNode);
+    *reinterpret_cast<void**>(splitNode) = nullptr;
+
+    // 归还部分的实际长度 = 总计数器 - 实际保留数
+    // 注意：如果计数器有偏差，这里用 batchNum 而不是遍历统计（归还部分可能也不完整）
+    size_t actualReturn = (batchNum > actualKeep) ? (batchNum - actualKeep) : 0;
+
+    // 使用实际保留数更新计数器（修正可能的偏差，防止死循环）
+    freeList_[index] = start;
+    freeListSize_[index] = actualKeep;
+
+    // 归还给 CentralCache
+    if (actualReturn > 0 && nextNode != nullptr)
     {
-        // 在分割点断开：保留部分尾节点.next = nullptr
-        void* nextNode = *reinterpret_cast<void**>(splitNode);
-        *reinterpret_cast<void**>(splitNode) = nullptr;
-
-        // 更新本地：保留 keepNum 块
-        freeList_[index] = start;
-        freeListSize_[index] = keepNum;
-
-        // 归还 returnNum 块给 CentralCache
-        if (returnNum > 0 && nextNode != nullptr)
-        {
-            CentralCache::getInstance().returnRange(nextNode, returnNum * alignedSize, index);
-        }
+        CentralCache::getInstance().returnRange(nextNode, actualReturn * alignedSize, index);
     }
 }
 
-} // namespace Kama_memoryPool
+} // namespace wevix_memoryPool

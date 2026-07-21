@@ -19,7 +19,7 @@
 //        bytes=24 → index=2 (24B 向上取整到 32B 类)
 //        bytes=256K → index=32767 (最后一个槽位)
 
-namespace Kama_memoryPool
+namespace wevix_memoryPool
 {
 
 // ---- 全局常量 ----
@@ -87,4 +87,4 @@ public:
     }
 };
 
-} // namespace Kama_memoryPool
+} // namespace wevix_memoryPool

@@ -31,7 +31,7 @@
 #include <sys/mman.h>   // mmap, munmap, MAP_FAILED
 #include <cstring>      // memset
 
-namespace Kama_memoryPool
+namespace wevix_memoryPool
 {
 
 // =========================================================================
@@ -284,4 +284,4 @@ void* PageCache::systemAlloc(size_t numPages)
     return ptr;
 }
 
-} // namespace Kama_memoryPool
+} // namespace wevix_memoryPool

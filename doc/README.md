@@ -34,6 +34,7 @@ doc/
 | 09 | [配置参数硬编码](optimizations/09-配置参数硬编码.md) | 阈值全部硬编码，无法运行时调整 | 🔧 工程 |
 | 10 | [blockNum等于1时无SpanTracker](optimizations/10-blockNum等于1时无SpanTracker.md) | blockNum==1 时创建 SpanTracker，大块正确回收 | ✅ 已修复 |
 | 11 | [PageCache中的new可能导致循环依赖](optimizations/11-PageCache中的new可能导致循环依赖.md) | `new Span` 本质是 malloc，若作为 malloc 替代品会死锁 | 🐛 隐患 |
+| 12 | [returnToCentralCache链表短于预期时静默失败](optimizations/12-returnToCentralCache链表短于预期时静默失败.md) | 链表短于 freeListSize_ 时 splitNode==null 跳过归还逻辑，死循环 | ✅ 已修复 |
 
 ---
 

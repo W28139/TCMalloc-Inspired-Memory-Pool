@@ -30,7 +30,7 @@
 //      数量通常 < 10000，开销可忽略
 //   3. 内存水位线 MAX_CACHED_PAGES = 128MB，超出后从大 Span 开始 munmap 归还 OS
 
-namespace Kama_memoryPool
+namespace wevix_memoryPool
 {
 
 class PageCache
@@ -84,4 +84,4 @@ private:
     std::mutex mutex_;
 };
 
-} // namespace Kama_memoryPool
+} // namespace wevix_memoryPool

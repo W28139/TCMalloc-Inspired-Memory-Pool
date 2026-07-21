@@ -19,7 +19,7 @@
 //   3. 释放时插入 freeList_[index] 头部，计数超 256 则归还 3/4 给 CentralCache
 //   4. thread_local 保证无锁 —— 每个线程只操作自己的 freeList_
 
-namespace Kama_memoryPool
+namespace wevix_memoryPool
 {
 
 class ThreadCache
@@ -66,4 +66,4 @@ private:
     std::array<size_t, FREE_LIST_SIZE> freeListSize_;
 };
 
-} // namespace Kama_memoryPool
+} // namespace wevix_memoryPool

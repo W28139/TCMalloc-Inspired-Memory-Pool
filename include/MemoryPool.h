@@ -21,7 +21,7 @@
 //                                        → 超阈值 → returnToCentralCache
 //                                           → CentralCache::returnRange
 
-namespace Kama_memoryPool
+namespace wevix_memoryPool
 {
 
 class MemoryPool
@@ -41,4 +41,4 @@ public:
     }
 };
 
-} // namespace Kama_memoryPool
+} // namespace wevix_memoryPool

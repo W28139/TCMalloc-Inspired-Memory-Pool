@@ -7,7 +7,7 @@
 #include <thread>
 #include <array>
 
-using namespace Kama_memoryPool;
+using namespace wevix_memoryPool;
 using namespace std::chrono;
 
 // 计时器类
