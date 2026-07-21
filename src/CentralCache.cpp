@@ -511,20 +511,33 @@ void CentralCache::performDelayedReturn(size_t index)
 //   newFreeBlocks - 本次统计发现该 Span 在空闲链表中的块数
 //   index         - 大小类别索引（用于访问 centralFreeList_）
 
-void CentralCache::updateSpanFreeCount(SpanTracker* tracker, size_t newFreeBlocks, size_t index)
+void CentralCache::updateSpanFreeCount(SpanTracker* tracker, size_t freeBlocksInList, size_t index)
 {
-    // --- 第 1 步：更新空闲计数 ---
-    // 注意：freeCount 跟踪的是 Span 创建以来的累计空闲块数
-    // newFreeBlocks 是本次扫描在链表中找到的块数
-    size_t oldFreeCount = tracker->freeCount.load(std::memory_order_relaxed);
-    size_t newFreeCount = oldFreeCount + newFreeBlocks;
-    tracker->freeCount.store(newFreeCount, std::memory_order_release);
+    // --- 第 1 步：更新空闲计数（直接设置，而非累加）---
+    //
+    // 为什么用直接设置而不是累加？
+    //   performDelayedReturn 每次扫描的是 centralFreeList_ 中【当前所有】的空闲块，
+    //   这里面包含了前几次扫描就已经在链表中的块（如果它们没被 fetchRange 取走）。
+    //   如果用累加（oldFreeCount + freeBlocksInList），同一批块会被反复计数，
+    //   导致 freeCount 虚高、超过 blockCount，永远触发不了 (freeCount == blockCount) 的归还条件。
+    //
+    //   直接设置 freeCount = freeBlocksInList 的语义：
+    //     freeCount 表示"此刻在 centralFreeList_ 中该 Span 的空闲块数"。
+    //     fetchRange 取走块时已经做了 fetch_sub(-1)，扫描时用实际链表计数覆盖，
+    //     可以纠正 returnRange 带来的增量（returnRange 不更新 freeCount）。
+    //
+    //   关于 ThreadCache 持有块的场景：
+    //     如果 ThreadCache 本地 freeList_ 还缓存着该 Span 的块，它们不在 centralFreeList_ 中，
+    //     本次扫描统计不到，freeCount < blockCount，Span 不会被归还。
+    //     但等 ThreadCache 归还后，下一次 performDelayedReturn 扫描就能统计到全部块，
+    //     Span 最终会被正确归还——只是时机延后，不是"永不归还"。
+    tracker->freeCount.store(freeBlocksInList, std::memory_order_release);
 
     // --- 第 2 步：判断是否全部空闲 ---
     // 全部空闲的判定：freeCount == blockCount
     //   blockCount = 该 Span 总共被切分成的块数
-    //   freeCount  = 累计回到中心缓存的块数
-    if (newFreeCount == tracker->blockCount.load(std::memory_order_relaxed))
+    //   freeCount  = 当前在 centralFreeList_ 中该 Span 的空闲块数
+    if (freeBlocksInList == tracker->blockCount.load(std::memory_order_relaxed))
     {
         // 读取 Span 的元信息
         void* spanAddr = tracker->spanAddr.load(std::memory_order_relaxed);

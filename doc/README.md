@@ -10,7 +10,8 @@
 doc/
 ├── README.md
 ├── optimizations/   ← 所有可优化点（bug / 性能 / 设计 / 工程）
-└── qa/              ← 学习过程中的 Q&A
+├── qa/              ← 学习过程中的 Q&A
+└── benchmarks/      ← 压测报告，每次更新一份
 ```
 
 ---
