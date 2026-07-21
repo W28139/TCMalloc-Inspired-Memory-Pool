@@ -1,42 +1,83 @@
 #include "../include/ThreadCache.h"
 #include "../include/CentralCache.h"
 
+// ============================================================================
+// ThreadCache —— 线程本地缓存实现
+// ============================================================================
+//
+// 每个线程独立的 TLS 缓存。绝大多数 allocate/deallocate 只在本层完成。
+//
+// ── 数据流 ──
+//
+//   allocate(size)
+//     → getIndex → freeListSize_[i]-- → 查 freeList_[i]
+//       → 命中：取链表头返回（O(1)，无锁）
+//       → 不命中：fetchFromCentralCache(i) → 批量拿 8 块，1 块返回，7 块进本地
+//
+//   deallocate(ptr, size)
+//     → getIndex → 插入 freeList_[i] 头部 → freeListSize_[i]++
+//       → > 256 时：returnToCentralCache → 保留 1/4，归还 3/4 给 CentralCache
+//
+// ── 关键修复 #02 ──
+//   freeListSize_[i]-- 从无条件执行改为只在成功取块后执行（防止无符号下溢）
+//   fetchFromCentralCache 中 freeListSize_ 加 batchNum-1 而非 batchNum
+//   （原代码两个错误互相抵消：allocate 多减 1 + fetch 多加 1 = 巧合正确）
+
 namespace Kama_memoryPool
 {
 
+// =========================================================================
+// allocate —— 线程本地分配入口
+// =========================================================================
+//
+// 快速路径：freeList_[index] 命中 → 取链表头，O(1) 返回
+// 慢速路径：freeList_[index] 为空 → fetchFromCentralCache → CentralCache 取批次
+//
+// 注意：freeListSize_[index] 只在真正从 freeList_ 取块时才减 1
+// （修复 #02：之前无条件递减，链表空时 size_t 下溢到 SIZE_MAX）
 void* ThreadCache::allocate(size_t size)
 {
-    // 处理0大小的分配请求
+    // 0 字节请求 → 至少分配一个对齐单位
     if (size == 0)
     {
-        size = ALIGNMENT; // 至少分配一个对齐大小
+        size = ALIGNMENT; // 8 字节
     }
-    
+
+    // 超大对象（>256KB）直接走系统 malloc，不进内存池
     if (size > MAX_BYTES)
     {
-        // 大对象直接从系统分配
         return malloc(size);
     }
 
-    // 获取下标，从0开始，每隔8字节为1位，0字节默认在第0处
+    // 计算大小类别索引：8B→0, 16B→1, 32B→2, ...
     size_t index = SizeClass::getIndex(size);
 
-    // 检查线程本地自由链表
-    // 如果 freeList_[index] 不为空，表示该链表中有可用内存块
+    // 先检查本地是否有现成的空闲块（快速路径，无锁）
     if (void* ptr = freeList_[index])
     {
-        // 从 freeList_ 中取走一块，更新链表头和计数
+        // 取链表头，更新链表头为 next
+        // freeList_[index] → [块A] → [块B] → ...
+        //          ptr = 块A
+        // 取走后：freeList_[index] → [块B] → ...
         freeList_[index] = *reinterpret_cast<void**>(ptr);
+        // 计数减 1（只在成功取块时才减，避免无符号下溢）
         freeListSize_[index]--;
         return ptr;
     }
 
-    // 如果线程本地自由链表为空，则从中心缓存获取一块内存
+    // 慢速路径：本地无货，从 CentralCache 批量获取
     return fetchFromCentralCache(index);
 }
 
+// =========================================================================
+// deallocate —— 线程本地释放入口
+// =========================================================================
+//
+// 插入 freeList_[index] 头部（O(1)），计数 +1。
+// 超过 256 个空闲块时触发 returnToCentralCache，归还 3/4 给 CentralCache。
 void ThreadCache::deallocate(void* ptr, size_t size)
 {
+    // 大对象直接 free
     if (size > MAX_BYTES)
     {
         free(ptr);
@@ -45,100 +86,114 @@ void ThreadCache::deallocate(void* ptr, size_t size)
 
     size_t index = SizeClass::getIndex(size);
 
-    // 插入到线程本地自由链表
+    // 头插法插入自由链表：新块.next = 旧链表头
+    // 插入前：freeList_[index] → [旧链表...]
+    // 插入后：freeList_[index] → [ptr] → [旧链表...]
     *reinterpret_cast<void**>(ptr) = freeList_[index];
     freeList_[index] = ptr;
 
-    // 更新对应自由链表的长度计数
-    freeListSize_[index]++; 
+    // 计数 +1
+    freeListSize_[index]++;
 
-    // 判断是否需要将部分内存回收给中心缓存
+    // 超过阈值（256）→ 归还 3/4 给 CentralCache
     if (shouldReturnToCentralCache(index))
     {
         returnToCentralCache(freeList_[index], size);
     }
 }
 
-// 判断是否需要将内存回收给中心缓存
+// =========================================================================
+// shouldReturnToCentralCache —— 判断是否触发归还
+// =========================================================================
+//
+// 阈值 256：ThreadCache 最多缓存 256 个同大小块，超出则归还 3/4。
+// 这个值平衡了本地缓存命中率和内存占用。
 bool ThreadCache::shouldReturnToCentralCache(size_t index)
 {
-    // 设定阈值，例如：当自由链表的大小超过一定数量时
-    size_t threshold = 256; 
+    size_t threshold = 256;
     return (freeListSize_[index] > threshold);
 }
 
+// =========================================================================
+// fetchFromCentralCache —— 从 CentralCache 批量获取内存块
+// =========================================================================
+//
+// 调用 CentralCache::fetchRange 拿到最多 BATCH_SIZE(8) 块的链表，
+// 第一块返回给调用者，剩余 7 块放入本地 freeList_ 供后续快速命中。
+//
+// 修复 #02：freeListSize_ += batchNum - 1（batchNum 含返回给用户的那块）
 void* ThreadCache::fetchFromCentralCache(size_t index)
 {
-    // 从中心缓存一块获取内存
+    // 从 CentralCache 批量取货（最多 8 块的链表）
     void* start = CentralCache::getInstance().fetchRange(index);
-    if (!start) return nullptr;
+    if (!start) return nullptr; // 系统内存耗尽
 
-    // 取一个返回，其余放入自由链表
+    // start 是链表头，第一块返回给用户
     void* result = start;
+    // 剩余块放入本地 freeList_
     freeList_[index] = *reinterpret_cast<void**>(start);
-    
-    // 更新自由链表大小
-    size_t batchNum = 0;
-    void* current = start; // 从start开始遍历
 
-    // 计算从中心缓存获取的内存块数量
+    // 统计 batchNum（链表长度），更新 freeListSize_
+    size_t batchNum = 0;
+    void* current = start;
     while (current != nullptr)
     {
         batchNum++;
-        current = *reinterpret_cast<void**>(current); // 遍历下一个内存块
+        current = *reinterpret_cast<void**>(current);
     }
 
-    // 更新freeListSize_：batchNum 包含返回给用户的那一块，
-    // 实际放入 freeList_ 的是 batchNum - 1 块
+    // batchNum 包含返回给用户的 result，实际进本地的是 batchNum-1 块
+    // 修复 #02：从 += batchNum 改为 += batchNum-1
     freeListSize_[index] += batchNum - 1;
-    
+
     return result;
 }
 
+// =========================================================================
+// returnToCentralCache —— 归还多余块给 CentralCache
+// =========================================================================
+//
+// 当 freeListSize_[index] > 256 时触发。
+// 策略：保留 1/4（至少 1 块），归还 3/4。
+// 遍历链表找到保留/归还的分割点，断开后调用 CentralCache::returnRange。
 void ThreadCache::returnToCentralCache(void* start, size_t size)
 {
-    // 根据大小计算对应的索引
     size_t index = SizeClass::getIndex(size);
-
-    // 获取对齐后的实际块大小
     size_t alignedSize = SizeClass::roundUp(size);
 
-    // 计算要归还内存块数量
+    // 当前链表长度
     size_t batchNum = freeListSize_[index];
-    if (batchNum <= 1) return; // 如果只有一个块，则不归还
+    if (batchNum <= 1) return; // 只有 1 块就不还了
 
-    // 保留一部分在ThreadCache中（比如保留1/4）
+    // 保留 1/4，归还 3/4
     size_t keepNum = std::max(batchNum / 4, size_t(1));
     size_t returnNum = batchNum - keepNum;
 
-    // 将内存块串成链表
+    // 遍历链表找到保留部分的尾节点（第 keepNum 个节点）
     char* current = static_cast<char*>(start);
-    // 使用对齐后的大小计算分割点
     char* splitNode = current;
-    for (size_t i = 0; i < keepNum - 1; ++i) 
+    for (size_t i = 0; i < keepNum - 1; ++i)
     {
         splitNode = reinterpret_cast<char*>(*reinterpret_cast<void**>(splitNode));
-        if (splitNode == nullptr) 
+        if (splitNode == nullptr)
         {
-            // 如果链表提前结束，更新实际的返回数量
+            // 链表比预期短，调整归还数量
             returnNum = batchNum - (i + 1);
             break;
         }
     }
 
-    if (splitNode != nullptr) 
+    if (splitNode != nullptr)
     {
-        // 将要返回的部分和要保留的部分断开
+        // 在分割点断开：保留部分尾节点.next = nullptr
         void* nextNode = *reinterpret_cast<void**>(splitNode);
-        *reinterpret_cast<void**>(splitNode) = nullptr; // 断开连接
+        *reinterpret_cast<void**>(splitNode) = nullptr;
 
-        // 更新ThreadCache的空闲链表
+        // 更新本地：保留 keepNum 块
         freeList_[index] = start;
-
-        // 更新自由链表大小
         freeListSize_[index] = keepNum;
 
-        // 将剩余部分返回给CentralCache
+        // 归还 returnNum 块给 CentralCache
         if (returnNum > 0 && nextNode != nullptr)
         {
             CentralCache::getInstance().returnRange(nextNode, returnNum * alignedSize, index);
@@ -146,4 +201,4 @@ void ThreadCache::returnToCentralCache(void* start, size_t size)
     }
 }
 
-} // namespace memoryPool
+} // namespace Kama_memoryPool
