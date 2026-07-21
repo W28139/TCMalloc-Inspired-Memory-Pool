@@ -79,8 +79,8 @@ void CentralCache::updateSpanFreeCount(SpanTracker* tracker, size_t freeBlocksIn
 | MultiThreaded | 8.958 ms | 8.883 ms | −0.075 ms | ↓ 0.8% |
 | MixedSizes | 2.723 ms | 2.820 ms | +0.097 ms | ↑ 3.6% |
 
-> 修复后：24 轮测试，数据来源同环境 `bin/perf_test`（WSL2, g++ -O2, C++17）
+> 修复后：24 轮测试，`bin/perf_test`（WSL2, g++ -O2, C++17）。修复前数据取自 `00-压测基线.md`（同环境不同时段，绝对值仅供参考，差值反映修复影响）。
 
-**结论：修复对性能无实质影响。** 三个场景的波动均在 ±4% 以内，属于正常噪声范围。这是预期结果——修复只改变了 `updateSpanFreeCount` 中的赋值方式（累加 → 直接设置），不影响热路径（`fetchRange` / `returnRange`），仅在 `performDelayedReturn` 触发时多执行一次 `store` 替代 `load + add + store`，开销可忽略。
+**结论：修复对性能无实质影响。** 三个场景的波动均在 ±4% 以内，属于正常噪声范围。修复只改变了 `updateSpanFreeCount` 中的赋值方式（累加 → 直接设置），不影响热路径。
 
-**稳定性**：24 轮中 MixedSizes 出现 1 次 segfault（~4%），该崩溃与本次修复无关，初步判断源于其他已知 bug（如 #2 `freeListSize` 无符号下溢 或 #10 `blockNum==1` 时无 SpanTracker 导致大块访问越界）。后续修复时应持续关注崩溃率变化。
+**稳定性**：24 轮中 MixedSizes 出现 1 次 segfault（~4%），根因是 #2 `freeListSize_` 无符号下溢，Fix#2 修复后崩溃消失。

@@ -27,7 +27,14 @@ private:
     PageCache() = default;
 
     // 向系统申请内存
-    void* systemAlloc(size_t numPages); 
+    void* systemAlloc(size_t numPages);
+    // 缓存超阈值时释放多余 Span 归还 OS
+    void releaseExcessSpans();
+
+    // 内存水位线配置
+    static const size_t MAX_CACHED_PAGES = 32768;   // 最大缓存 128MB
+    size_t cachedPages_{0};                          // 当前缓存的页数
+
 private:
     struct Span
     {

@@ -115,20 +115,15 @@ void* PageCache::allocateSpan(size_t numPages)
         Span* span = it->second;
 
         // --- A.1 将取出的 Span 从 freeSpans_ 中移除 ---
-        //
-        // freeSpans_[it->first] 是一个链表，span 是链表头
-        // 如果链表有多个节点：头指针移到 span->next
-        // 如果链表只有这一个节点：整个条目从 map 中删除
+        // 同步扣减缓存页数计数
+        cachedPages_ -= span->numPages;
+
         if (span->next)
         {
-            // 链表不止一个 Span：链表头移到下一个
             freeSpans_[it->first] = span->next;
         }
         else
         {
-            // 链表仅此一个 Span：删除整个条目
-            // 此时这个页数在 map 中不存在了，
-            // 直到未来有同页数的 Span 被释放回来才会重新出现
             freeSpans_.erase(it);
         }
 
@@ -173,10 +168,11 @@ void* PageCache::allocateSpan(size_t numPages)
             auto& list = freeSpans_[newSpan->numPages];
 
             // 头插法：newSpan 放在链表最前面
-            // 合并前：list → oldHead → ...
-            // 合并后：list → newSpan → oldHead → ...
             newSpan->next = list;
             list = newSpan;
+
+            // 剩余部分放回缓存，同步增加页数计数
+            cachedPages_ += newSpan->numPages;
 
             // 更新被取走部分的页数为请求的页数
             span->numPages = numPages;
@@ -339,27 +335,80 @@ void PageCache::deallocateSpan(void* ptr, size_t numPages)
     }
 
     // ---- 第 4 步：将（合并后的）Span 插入 freeSpans_ 空闲列表 ----
-    //
-    // 使用头插法，O(1) 时间插入链表头部
-    //
-    // 插入前：
-    //   freeSpans_[span->numPages] → existingHead → ...
-    //
-    // 插入后：
-    //   freeSpans_[span->numPages] → [span] → existingHead → ...
-    //
-    // auto& list 是 freeSpans_[span->numPages] 的引用
     auto& list = freeSpans_[span->numPages];
-    span->next = list;   // span 的 next 指向旧链表头
-    list = span;         // 链表头更新为 span
+    span->next = list;
+    list = span;
 
-    // 注意：这里并没有调用 munmap 把内存还给操作系统！
-    // Span 被缓存在 freeSpans_ 中，等待下次 allocateSpan 直接复用。
-    // 这避免了频繁的 mmap/munmap 系统调用。
-    //
-    // 如果未来需要真正归还内存（如进程内存压力大时），
-    // 可以在这里添加策略：如果 freeSpans_ 中缓存的页数超过某个阈值，
-    // 就调 munmap 真正释放一部分。
+    // 更新缓存页数计数
+    cachedPages_ += span->numPages;
+
+    // ---- 第 5 步：内存水位线检查 ----
+    // 缓存超过阈值（128MB），从最大的 Span 开始释放归还 OS
+    if (cachedPages_ > MAX_CACHED_PAGES)
+    {
+        releaseExcessSpans();
+    }
+}
+
+// =========================================================================
+// releaseExcessSpans —— 缓存超阈值时释放多余 Span 归还 OS
+// =========================================================================
+//
+// 触发条件：cachedPages_ > MAX_CACHED_PAGES (128MB)
+// 释放目标：降到 MAX_CACHED_PAGES / 2 (64MB)
+// 释放顺序：从大 Span 开始（减少碎片，提高后续大请求的命中率）
+//
+// 每释放一个 Span：
+//   1. 从 freeSpans_ 链表摘除
+//   2. 从 spanMap_ 移除
+//   3. munmap 归还物理内存
+//   4. delete Span 控制块
+//   5. cachedPages_ 扣减
+
+void PageCache::releaseExcessSpans()
+{
+    // 目标：降到阈值的一半，留出缓冲避免频繁触发
+    size_t targetPages = MAX_CACHED_PAGES / 2;
+
+    // 从最大的 Span 开始释放（reverse_iterator 从大到小遍历 map）
+    for (auto it = freeSpans_.rbegin();
+         it != freeSpans_.rend() && cachedPages_ > targetPages; )
+    {
+        Span* span = it->second;
+        while (span && cachedPages_ > targetPages)
+        {
+            Span* next = span->next;
+
+            // munmap 归还物理内存给 OS
+            munmap(span->pageAddr, span->numPages * PAGE_SIZE);
+
+            // 从 spanMap_ 移除
+            spanMap_.erase(span->pageAddr);
+
+            // 扣减缓存计数
+            cachedPages_ -= span->numPages;
+
+            // 释放 Span 控制块
+            delete span;
+
+            span = next;
+        }
+
+        // 更新该页数的链表头（可能已全部释放 → nullptr）
+        it->second = span;
+
+        if (span == nullptr)
+        {
+            // 该页数的链表已空，从 map 中删除条目
+            // 注意：erase reverse_iterator 需要用 base() 转换
+            it = std::map<size_t, Span*>::reverse_iterator(
+                freeSpans_.erase(std::next(it).base()));
+        }
+        else
+        {
+            ++it;
+        }
+    }
 }
 
 // =========================================================================

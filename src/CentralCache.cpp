@@ -30,6 +30,7 @@
 #include <cassert>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 
 namespace Kama_memoryPool
 {
@@ -88,10 +89,21 @@ CentralCache::CentralCache()
 
     // spanCount_：已使用的 SpanTracker 数量（同时也是下一个可用槽位的下标）
     spanCount_.store(0, std::memory_order_relaxed);
+
+    // --- 初始化 SpanTracker 动态数组（无锁读结构）---
+    // 预分配 TRACKER_INITIAL_CAPACITY 个 SpanTracker，构建扁平指针数组
+    SpanTracker** initialArray = new SpanTracker*[TRACKER_INITIAL_CAPACITY];
+    for (size_t i = 0; i < TRACKER_INITIAL_CAPACITY; ++i)
+    {
+        trackerStorage_.emplace_back();
+        initialArray[i] = &trackerStorage_.back();
+    }
+    trackerArray_.store(initialArray, std::memory_order_release);
+    trackerCount_.store(TRACKER_INITIAL_CAPACITY, std::memory_order_release);
 }
 
 // =========================================================================
-// fetchRange —— 向 ThreadCache 分发一批内存块
+// fetchRange —— 向 ThreadCache 批量分发内存块
 // =========================================================================
 //
 // 这是 CentralCache 最核心的"出货"函数。ThreadCache 在本地缓存不足时调用它。
@@ -100,16 +112,17 @@ CentralCache::CentralCache()
 //   index - 大小类别索引。例如 index=2 对应 (2+1)*8=24→向上取整到32字节的大小类
 //
 // 返回值：
-//   单个内存块的地址（void*），由 ThreadCache 取走使用
-//   同时 centralFreeList_[index] 中还保留剩余块供后续请求使用
+//   一段链表的头指针（void*），链表包含最多 BATCH_SIZE(8) 个内存块。
+//   ThreadCache 取走第一块，其余 BATCH_SIZE-1 块进入其本地 freeList_，
+//   后续 allocate 直接命中 ThreadCache，无需再跨层调用。
 //
 // 流程概要：
 //   ┌─ 检查 index 合法性
 //   ├─ 获取自旋锁 locks_[index]
 //   ├─ 尝试从 centralFreeList_[index] 取已有的空闲块
-//   │   ├─ 有 → 取链表头，更新链表，更新 SpanTracker 计数
-//   │   └─ 无 → 从 PageCache 申请新 Span → 切分成小块 → 串成链表 → 取链表头
-//   └─ 释放自旋锁，返回取到的块
+//   │   ├─ 有 → 批量取 BATCH_SIZE 块，断开链表，逐个更新 SpanTracker
+//   │   └─ 无 → 从 PageCache 申请新 Span → 切分 → 批量取 BATCH_SIZE 块
+//   └─ 释放自旋锁，返回批次链表
 
 void* CentralCache::fetchRange(size_t index)
 {
@@ -202,84 +215,120 @@ void* CentralCache::fetchRange(size_t index)
                 // 最后一块的前 8 字节写入 nullptr，标记链表结束
                 *reinterpret_cast<void**>(start + (blockNum - 1) * size) = nullptr;
 
-                // --- 从链表中取出第一块返回给 ThreadCache，其余留在 CentralCache ---
+                // --- 批量传输：从链表头取 BATCH_SIZE 块给 ThreadCache ---
                 //
-                // 此时链表状态：
-                //   result(块0) → 块1 → 块2 → ... → nullptr
+                // 此时链表：result(块0) → 块1 → ... → 块(BATCH_SIZE-1) → ... → nullptr
+                // 目标：前 BATCH_SIZE 块作为一批返回，其余留在 CentralCache
                 //
-                // 目标：
-                //   result 单独返回给 ThreadCache
-                //   块1 → 块2 → ... → nullptr 挂在 centralFreeList_[index] 上
+                // 找出第 BATCH_SIZE 块（批次的尾节点）
+                size_t batchCount = 1;
+                void* batchTail = result;
+                while (batchCount < BATCH_SIZE && batchCount < blockNum &&
+                       *reinterpret_cast<void**>(batchTail) != nullptr)
+                {
+                    batchTail = *reinterpret_cast<void**>(batchTail);
+                    batchCount++;
+                }
 
-                // 保存块0的 next（即块1的地址）
-                void* next = *reinterpret_cast<void**>(result);
+                // 保存批次之后剩余链表的头
+                void* rest = *reinterpret_cast<void**>(batchTail);
 
-                // 将块0的 next 置空（块 0 即将返回给用户，不需要链表连接）
-                *reinterpret_cast<void**>(result) = nullptr;
+                // 在批次尾断开连接
+                *reinterpret_cast<void**>(batchTail) = nullptr;
 
-                // 将剩余链表（块1 → 块2 → ... → nullptr）更新到中心缓存
-                centralFreeList_[index].store(next, std::memory_order_release);
+                // 剩余链表挂回 CentralCache
+                centralFreeList_[index].store(rest, std::memory_order_release);
 
-                // --- 记录 SpanTracker：跟踪这个 Span 的空闲情况 ---
-                //
-                // 为什么需要 SpanTracker？
-                //   1. CentralCache 管理的是切分后的小块，它们物理上可能散布在不同 Span 中
-                //   2. PageCache::deallocateSpan 要求归还"连续的整块内存"
-                //   3. 只有当一个 Span 的所有小块都归还（freeCount == blockCount），
-                //      才能把这个 Span 整体归还给 PageCache
-                //
-                // spanCount_ 原子递增，既拿到当前槽位号，又为下一次分配预留
+                // --- 记录 SpanTracker ---
                 size_t trackerIndex = spanCount_++;
 
-                if (trackerIndex < spanTrackers_.size())
+                if (trackerIndex >= trackerCount_.load(std::memory_order_relaxed))
                 {
-                    // spanAddr：这个 Span 在内存中的起始地址
-                    spanTrackers_[trackerIndex].spanAddr.store(start, std::memory_order_release);
-                    // numPages：这个 Span 包含多少页
-                    spanTrackers_[trackerIndex].numPages.store(numPages, std::memory_order_release);
-                    // blockCount：这个 Span 被切分成的总块数
-                    spanTrackers_[trackerIndex].blockCount.store(blockNum, std::memory_order_release);
-                    // freeCount：初始空闲块数 = blockNum - 1
-                    // 因为第一块（result）已被取走，不计算在"空闲"中
-                    spanTrackers_[trackerIndex].freeCount.store(blockNum - 1, std::memory_order_release);
+                    expandTrackerArray(trackerIndex);
+                }
+
+                SpanTracker** array = trackerArray_.load(std::memory_order_acquire);
+                SpanTracker* tracker = array[trackerIndex];
+
+                tracker->spanAddr.store(start, std::memory_order_release);
+                tracker->numPages.store(numPages, std::memory_order_release);
+                tracker->blockCount.store(blockNum, std::memory_order_release);
+                // freeCount：初始空闲 = 总块数 - 已取走的批次块数
+                tracker->freeCount.store(blockNum - batchCount, std::memory_order_release);
+
+                // 未排序条目超阈值时触发重排序
+                size_t total = spanCount_.load(std::memory_order_relaxed);
+                size_t sorted = sortedCount_.load(std::memory_order_relaxed);
+                if (total > sorted && (total - sorted) > SORT_THRESHOLD)
+                {
+                    ensureSorted();
                 }
             }
-            // 注：如果 blockNum <= 1（理论上不太会发生），result 就是唯一一块，
-            // 不需要构建链表，也不需要 SpanTracker。直接返回就行。
+            else
+            {
+                // blockNum == 1：大对象（>16KB）场景，只有一块无需构建链表，
+                // 但仍需 SpanTracker，否则该 Span 永远无法归还 PageCache
+                size_t trackerIndex = spanCount_++;
+
+                if (trackerIndex >= trackerCount_.load(std::memory_order_relaxed))
+                {
+                    expandTrackerArray(trackerIndex);
+                }
+
+                SpanTracker** array = trackerArray_.load(std::memory_order_acquire);
+                SpanTracker* tracker = array[trackerIndex];
+
+                tracker->spanAddr.store(start, std::memory_order_release);
+                tracker->numPages.store(numPages, std::memory_order_release);
+                tracker->blockCount.store(1, std::memory_order_release);
+                // freeCount = 0：唯一一块已返回给 ThreadCache，Span 中无空闲块
+                tracker->freeCount.store(0, std::memory_order_release);
+
+                // 检查是否需要重排序
+                size_t total = spanCount_.load(std::memory_order_relaxed);
+                size_t sorted = sortedCount_.load(std::memory_order_relaxed);
+                if (total > sorted && (total - sorted) > SORT_THRESHOLD)
+                {
+                    ensureSorted();
+                }
+            }
         }
         else
         {
             // ================================================
-            // 分支 B：中心缓存有现成的空闲块 → 直接取链表头
+            // 分支 B：中心缓存有现成的空闲块 → 批量取 BATCH_SIZE 块
             // ================================================
 
-            // 此时链表状态：
-            //   result(头节点) → 块X → 块Y → ... → nullptr
-            //
-            // 目标：
-            //   result 返回给 ThreadCache
-            //   块X → 块Y → ... → nullptr 更新为新的链表头
-
-            // 保存链表第二个节点的地址（块X）
-            void* next = *reinterpret_cast<void**>(result);
-
-            // 断开 result 与链表的连接
-            *reinterpret_cast<void**>(result) = nullptr;
-
-            // 将剩余链表更新到中心缓存
-            centralFreeList_[index].store(next, std::memory_order_release);
-
-            // --- 更新 SpanTracker：这个块被取走了，空闲计数 -1 ---
-            //
-            // getSpanTracker 做的事：
-            //   遍历 spanTrackers_，找到 result 这个地址属于哪个 Span
-            //   判断方式：spanAddr ≤ result < spanAddr + numPages * PAGE_SIZE
-            SpanTracker* tracker = getSpanTracker(result);
-            if (tracker)
+            // 遍历找出批次的尾节点（第 BATCH_SIZE 块，或链表末尾）
+            size_t batchCount = 1;
+            void* batchTail = result;
+            while (batchCount < BATCH_SIZE &&
+                   *reinterpret_cast<void**>(batchTail) != nullptr)
             {
-                // fetch_sub：原子地将 freeCount 减 1
-                // 例：之前 5 块空闲，取走 1 块 → freeCount 变为 4
-                tracker->freeCount.fetch_sub(1, std::memory_order_release);
+                batchTail = *reinterpret_cast<void**>(batchTail);
+                batchCount++;
+            }
+
+            // 保存批次之后剩余链表的头
+            void* rest = *reinterpret_cast<void**>(batchTail);
+
+            // 在批次尾断开连接
+            *reinterpret_cast<void**>(batchTail) = nullptr;
+
+            // 剩余链表挂回 CentralCache
+            centralFreeList_[index].store(rest, std::memory_order_release);
+
+            // --- 更新 SpanTracker：批次中每块的 freeCount 减 1 ---
+            // 批次内块可能来自不同 Span，逐块查找并递减
+            void* current = result;
+            for (size_t i = 0; i < batchCount; ++i)
+            {
+                SpanTracker* tracker = getSpanTracker(current);
+                if (tracker)
+                {
+                    tracker->freeCount.fetch_sub(1, std::memory_order_release);
+                }
+                current = *reinterpret_cast<void**>(current);
             }
         }
     }
@@ -459,38 +508,35 @@ void CentralCache::performDelayedReturn(size_t index)
     delayCounts_[index].store(0, std::memory_order_relaxed);
     lastReturnTimes_[index] = std::chrono::steady_clock::now();
 
-    // --- 遍历空闲链表，按 Span 分组统计 ---
-    //
-    // 为什么需要 std::unordered_map？
-    //   中心缓存的空闲链表可能混合了来自不同 Span 的内存块：
-    //     centralFreeList_[2] → [SpanA的块1] → [SpanB的块5] → [SpanA的块3] → ...
-    //   必须按 Span 分组后，才能知道每个 Span 分别有多少块空闲
-    //
-    // spanFreeCounts 的结构：
-    //   { SpanTrackerA* → 该 Span 在空闲链表中出现的次数, ... }
-    std::unordered_map<SpanTracker*, size_t> spanFreeCounts;
+    // 两遍扫描替代 unordered_map，消除自旋锁临界区内的堆分配：
+    //   第一遍：遍历 centralFreeList_，在 SpanTracker.scanCount 上原子累加
+    //   第二遍：遍历所有 SpanTracker，取出 scanCount 并调用 updateSpanFreeCount
 
-    // 从头遍历空闲链表
+    // --- 第一遍：按 Span 累加空闲块计数 ---
     void* currentBlock = centralFreeList_[index].load(std::memory_order_relaxed);
-
     while (currentBlock)
     {
-        // 查找当前块属于哪个 Span
         SpanTracker* tracker = getSpanTracker(currentBlock);
         if (tracker)
         {
-            // 该 Span 的空闲计数 +1
-            spanFreeCounts[tracker]++;
+            tracker->scanCount.fetch_add(1, std::memory_order_relaxed);
         }
-        // 移动到链表中的下一块
         currentBlock = *reinterpret_cast<void**>(currentBlock);
     }
 
-    // --- 逐个 Span 更新空闲计数并判断是否可归还 ---
-    // C++17 结构化绑定：直接解包 unordered_map 的 key 和 value
-    for (const auto& [tracker, newFreeBlocks] : spanFreeCounts)
+    // --- 第二遍：处理有 scanCount > 0 的 Span ---
+    SpanTracker** array = trackerArray_.load(std::memory_order_acquire);
+    size_t total = spanCount_.load(std::memory_order_relaxed);
+
+    for (size_t i = 0; i < total; ++i)
     {
-        updateSpanFreeCount(tracker, newFreeBlocks, index);
+        SpanTracker* tracker = array[i];
+        // 原子交换取出计数并清零，为下次扫描做准备
+        size_t count = tracker->scanCount.exchange(0, std::memory_order_relaxed);
+        if (count > 0)
+        {
+            updateSpanFreeCount(tracker, count, index);
+        }
     }
 }
 
@@ -637,37 +683,166 @@ void* CentralCache::fetchFromPageCache(size_t size)
 // getSpanTracker —— 给定一个内存块地址，找到它所属的 Span 追踪器
 // =========================================================================
 //
-// 这是 CentralCache 的"反向查找"函数：
-//   已知：一个切分后的小块地址（如 0x4280）
-//   求解：这个块最初是从哪个 Span 切出来的
-//
-// 查找方式：遍历 spanTrackers_ 数组（最多 1024 项），
-// 检查 blockAddr 是否在某个 Span 的地址范围内
-//
-// 复杂度：O(n)，n = spanCount_（当前活跃的 Span 数量，最多 1024）
-// 为什么不用 map？避免 map 本身依赖 malloc，造成循环依赖
+// 查找策略：二分查找（已排序部分）+ 线性扫描（未排序尾部）
+//   数组按 spanAddr 升序排列的前 sortedCount_ 个条目用二分（O(log n)），
+//   尾部未排序条目（最多 SORT_THRESHOLD=64 个）退化为线性扫描（O(1)）。
+//   重排序由 ensureSorted() 触发，使用与扩容相同的原子替换模式。
 
 SpanTracker* CentralCache::getSpanTracker(void* blockAddr)
 {
-    // 遍历所有已注册的 SpanTracker
-    for (size_t i = 0; i < spanCount_.load(std::memory_order_relaxed); ++i)
-    {
-        // 读取该 Span 的起始地址和页数
-        void* spanAddr = spanTrackers_[i].spanAddr.load(std::memory_order_relaxed);
-        size_t numPages = spanTrackers_[i].numPages.load(std::memory_order_relaxed);
+    SpanTracker** array = trackerArray_.load(std::memory_order_acquire);
+    size_t sorted = sortedCount_.load(std::memory_order_acquire);
+    size_t total = spanCount_.load(std::memory_order_relaxed);
 
-        // 判断 blockAddr 是否在这个 Span 的地址范围内
-        // 范围：[spanAddr, spanAddr + numPages * 4096)
-        if (blockAddr >= spanAddr &&
-            blockAddr < static_cast<char*>(spanAddr) + numPages * PageCache::PAGE_SIZE)
+    // ---- 阶段 1：在已排序部分二分查找 ----
+    size_t left = 0, right = sorted;
+    while (left < right)
+    {
+        size_t mid = left + (right - left) / 2;
+        SpanTracker* t = array[mid];
+        void* addr = t->spanAddr.load(std::memory_order_relaxed);
+
+        if (blockAddr < addr)
         {
-            // 找到了！返回该 SpanTracker 的地址
-            return &spanTrackers_[i];
+            right = mid;
+        }
+        else if (blockAddr >= static_cast<char*>(addr) +
+                 t->numPages.load(std::memory_order_relaxed) * PageCache::PAGE_SIZE)
+        {
+            left = mid + 1;
+        }
+        else
+        {
+            return t;  // 命中
         }
     }
-    // 未找到：blockAddr 不属于任何已记录的 Span
-    // 这可能发生在：1) 大对象直接走 malloc 的路径  2) 编程错误
+
+    // ---- 阶段 2：在未排序尾部线性扫描 ----
+    for (size_t i = sorted; i < total; ++i)
+    {
+        SpanTracker* t = array[i];
+        void* addr = t->spanAddr.load(std::memory_order_relaxed);
+        size_t pages = t->numPages.load(std::memory_order_relaxed);
+
+        if (blockAddr >= addr &&
+            blockAddr < static_cast<char*>(addr) + pages * PageCache::PAGE_SIZE)
+        {
+            return t;
+        }
+    }
     return nullptr;
+}
+
+// =========================================================================
+// expandTrackerArray —— 动态扩容追踪器数组
+// =========================================================================
+//
+// 扩容流程：
+//   1. 获取 expandMutex_（串行化扩容，极低频）
+//   2. 分配新的更大的指针数组
+//   3. 在 trackerStorage_ 中构造新的 SpanTracker 对象
+//   4. 将新旧指针一起填入新数组
+//   5. 原子交换 trackerArray_ 和 trackerCount_
+//   6. 旧数组泄漏（~8KB，扩容仅发生几次，可接受）
+//
+// 读路径（getSpanTracker）不受影响：旧数组在交换后仍然有效，
+// 已经在读取旧数组的线程可以继续安全遍历。
+
+void CentralCache::expandTrackerArray(size_t requiredIndex)
+{
+    std::lock_guard<std::mutex> lock(trackerExpandMutex_);
+
+    // 双重检查：可能其他线程已经扩容过了
+    if (requiredIndex < trackerCount_.load(std::memory_order_relaxed))
+        return;
+
+    size_t oldSize = trackerCount_.load(std::memory_order_relaxed);
+    size_t newSize = std::max(oldSize + TRACKER_EXPAND_SIZE, requiredIndex + 1);
+
+    // 分配新的指针数组
+    SpanTracker** newArray = new SpanTracker*[newSize];
+
+    // 复制旧指针
+    SpanTracker** oldArray = trackerArray_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < oldSize; ++i)
+    {
+        newArray[i] = oldArray[i];
+    }
+
+    // 在 trackerStorage_ 中构造新的 SpanTracker，填充新指针
+    for (size_t i = oldSize; i < newSize; ++i)
+    {
+        trackerStorage_.emplace_back();
+        newArray[i] = &trackerStorage_.back();
+    }
+
+    // 按 spanAddr 排序（Span 地址不重叠，排序后支持二分查找）
+    std::sort(newArray, newArray + newSize,
+        [](SpanTracker* a, SpanTracker* b) {
+            return a->spanAddr.load(std::memory_order_relaxed) <
+                   b->spanAddr.load(std::memory_order_relaxed);
+        });
+
+    // 原子交换：读路径从这里开始看到新数组
+    trackerArray_.store(newArray, std::memory_order_release);
+    trackerCount_.store(newSize, std::memory_order_release);
+    sortedCount_.store(newSize, std::memory_order_release);  // 新数组全排序
+
+    // 旧数组不释放（可能有读者还在用），由进程退出时 OS 回收
+}
+
+// =========================================================================
+// ensureSorted —— 未排序条目超阈值时重排序数组
+// =========================================================================
+//
+// 与扩容相同的原子替换模式：分配新数组 → 复制 → 排序 → 原子交换。
+// 触发条件：spanCount_ - sortedCount_ > SORT_THRESHOLD (64)
+
+void CentralCache::ensureSorted()
+{
+    size_t total = spanCount_.load(std::memory_order_relaxed);
+    size_t sorted = sortedCount_.load(std::memory_order_relaxed);
+
+    if (total - sorted <= SORT_THRESHOLD)
+        return;  // 未超阈值，无需重排
+
+    std::lock_guard<std::mutex> lock(trackerExpandMutex_);
+
+    // 双重检查
+    total = spanCount_.load(std::memory_order_relaxed);
+    sorted = sortedCount_.load(std::memory_order_relaxed);
+    if (total - sorted <= SORT_THRESHOLD)
+        return;
+
+    size_t arraySize = trackerCount_.load(std::memory_order_relaxed);
+
+    // 分配新数组
+    SpanTracker** newArray = new SpanTracker*[arraySize];
+
+    // 复制所有指针
+    SpanTracker** oldArray = trackerArray_.load(std::memory_order_acquire);
+    for (size_t i = 0; i < total; ++i)
+    {
+        newArray[i] = oldArray[i];
+    }
+    // 剩余未使用的槽位置空
+    for (size_t i = total; i < arraySize; ++i)
+    {
+        newArray[i] = oldArray[i];
+    }
+
+    // 对已使用的 [0, total) 部分按 spanAddr 排序
+    std::sort(newArray, newArray + total,
+        [](SpanTracker* a, SpanTracker* b) {
+            return a->spanAddr.load(std::memory_order_relaxed) <
+                   b->spanAddr.load(std::memory_order_relaxed);
+        });
+
+    // 原子交换
+    trackerArray_.store(newArray, std::memory_order_release);
+    sortedCount_.store(total, std::memory_order_release);
+
+    // 旧数组泄漏
 }
 
 } // namespace Kama_memoryPool
