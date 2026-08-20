@@ -1,6 +1,7 @@
 #pragma once
 #include "Common.h"
 #include <cstdlib>
+#include <cstdint>   // uint16_t（优化 #24/#25）
 
 // ============================================================================
 // ThreadCache —— 线程本地缓存（三层架构的第一层）
@@ -15,7 +16,7 @@
 //
 // 设计要点：
 //   1. 分配时先查 freeList_[index]，命中则 O(1) 取链表头
-//   2. 不命中则调用 CentralCache::fetchRange 批量取 BATCH_SIZE(8) 块
+//   2. 不命中则调用 CentralCache::fetchRange 批量取 BATCH_SIZE(32) 块
 //   3. 释放时插入 freeList_[index] 头部，计数超 256 则归还 3/4 给 CentralCache
 //   4. thread_local 保证无锁 —— 每个线程只操作自己的 freeList_
 
@@ -52,7 +53,7 @@ private:
     // 将超出阈值的内存块归还 CentralCache
     void returnToCentralCache(void* start, size_t size);
 
-    // 判断是否需要归还（freeListSize_[index] > 256）
+    // 判断是否需要归还（freeListSize_[index] > 1024，位掩码化）
     bool shouldReturnToCentralCache(size_t index);
 
 private:
@@ -63,7 +64,9 @@ private:
 
     // 每个自由链表当前的空闲块数量
     // 超过 256 触发 returnToCentralCache，保留 1/4 继续本地使用
-    std::array<size_t, FREE_LIST_SIZE> freeListSize_;
+    // 优化 #25：size_t → uint16_t（缓存足迹 256KB → 128KB，热路径命中率提升）。
+    // 上限边界：归还触发点 2048（位掩码后首次 1024 整数倍）+ 批量 31 = 2079 < 65535 ✓
+    std::array<uint16_t, FREE_LIST_SIZE> freeListSize_;
 };
 
 } // namespace wevix_memoryPool

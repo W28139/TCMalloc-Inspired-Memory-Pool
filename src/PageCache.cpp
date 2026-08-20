@@ -1,19 +1,5 @@
 /**
- * @file    PageCache.cpp
- * @brief   页缓存层 —— 直接与操作系统交互的底层内存管理者
- *
- * ── PageCache 在三层架构中的位置 ──
- *
- *   [ThreadCache]    ← 线程私有 TLS，无锁，分配第一站
- *        ↕
- *   [CentralCache]   ← 全局共享，桶级自旋锁，块级调度
- *        ↕
- *   [PageCache]      ← 全局共享，互斥锁，页级管理 ← 本文件
- *        ↕
- *   [OS Kernel]      ← mmap / munmap 系统调用
- *
  * ── 核心职责 ──
- *
  *   1. 以"页"（PAGE_SIZE = 4096B）为单位管理连续内存
  *   2. Span 切分：大 Span 切出所需部分，剩余缓存复用（Best-Fit）
  *   3. Span 合并：归还时检查后向相邻 Span，空闲则合并，对抗外部碎片
@@ -48,17 +34,12 @@ namespace wevix_memoryPool
 //      分支 B（没找到）：systemAlloc → mmap 新内存
 //   3. 记录 spanMap_（地址→Span 反查，供释放使用）
 //   4. 返回起始地址
-//
-// Best-Fit 示例：
-//   freeSpans_ = {1页, 3页, 5页, 10页}
-//   请求 4 页 → lower_bound(4) → 5 页条目 → 切分：3 页返回 + 2 页缓存
-//   请求 5 页 → lower_bound(5) → 5 页条目 → 精确匹配，直接返回
 
 void* PageCache::allocateSpan(size_t numPages)
 {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // ---- 在 freeSpans_ 中查找 Best-Fit ----
+    // 在 freeSpans_ 中寻找第一个 key ≥ numPages 的元素。
     auto it = freeSpans_.lower_bound(numPages);
 
     if (it != freeSpans_.end())
@@ -95,6 +76,13 @@ void* PageCache::allocateSpan(size_t numPages)
             auto& list = freeSpans_[newSpan->numPages];
             newSpan->next = list;
             list = newSpan;
+
+            // 修复 P1-3：剩余 Span 必须登记 spanMap_。
+            // 否则 deallocateSpan 的后向合并靠 spanMap_.find(nextAddr) 定位相邻 Span，
+            // 切分出的剩余部分从未被分配过时找不到 → 无法合并 → 外部碎片无法对抗。
+            // 合并逻辑本身无需改动：摘除检查（nextList == nextSpan）区分空闲/在用，
+            // 被合并时 spanMap_.erase(nextAddr) 已清理条目。
+            spanMap_[newSpan->pageAddr] = newSpan;
 
             // 剩余部分回到缓存，计数加回
             cachedPages_ += newSpan->numPages;
@@ -158,30 +146,42 @@ void PageCache::deallocateSpan(void* ptr, size_t numPages)
         Span* nextSpan = nextIt->second;
 
         // 验证 nextSpan 确实空闲（在 freeSpans_ 链表中）
+        // 修复 P1-4：用 find 替代 operator[]。
+        // operator[] 在"在用"的相邻 Span 的页数桶不存在时，会插入 {numPages → nullptr} 空条目：
+        // 1. map 无谓膨胀；2. allocateSpan 的 lower_bound 命中空条目时解引用 nullptr → 崩溃。
         bool found = false;
-        auto& nextList = freeSpans_[nextSpan->numPages];
+        auto listIt = freeSpans_.find(nextSpan->numPages);
+        if (listIt != freeSpans_.end())
+        {
+            Span*& nextList = listIt->second;
 
-        if (nextList == nextSpan)
-        {
-            nextList = nextSpan->next; // 头节点，直接摘除
-            found = true;
-        }
-        else if (nextList)
-        {
-            // 在链表中搜索
-            Span* prev = nextList;
-            while (prev->next)
+            // 判断: nextSpan 是不是 nextList 这条空闲链表的头节点
+            if (nextList == nextSpan)
             {
-                if (prev->next == nextSpan)
+                // nextSpan是在头部，更新头部为nextSpan的下一个span(摘除nextSpan)
+                nextList = nextSpan->next;
+                found = true;
+            }
+            // 不是头节点的话
+            else if (nextList)
+            {
+                // 在链表中搜索
+                Span* prev = nextList;
+                while (prev->next)
                 {
-                    prev->next = nextSpan->next;
-                    found = true;
-                    break;
+                    if (prev->next == nextSpan)
+                    {
+                        // 摘除nextSpan
+                        prev->next = nextSpan->next;
+                        found = true;
+                        break;
+                    }
+                    prev = prev->next;
                 }
-                prev = prev->next;
             }
         }
 
+        // 如果成功摘除，那就将span与nextspan合并，删除nextSpan(因为地址是相邻的，可以合并)
         if (found)
         {
             // 合并：扩大当前 Span 的页数，删除 nextSpan
@@ -191,7 +191,7 @@ void PageCache::deallocateSpan(void* ptr, size_t numPages)
         }
     }
 
-    // ---- 插入 freeSpans_ 空闲链表（头插法）----
+    // 插入 freeSpans_ 空闲链表（头插法
     auto& list = freeSpans_[span->numPages];
     span->next = list;
     list = span;
